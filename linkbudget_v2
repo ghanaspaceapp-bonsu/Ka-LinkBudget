@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import importlib.util
 import math
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
@@ -74,6 +76,121 @@ def coding_requirement(required_dB, coding_gain_dB, coding_threshold_dB):
     return required_dB - coding_gain_dB + coding_threshold_dB
 
 
+def noise_power_density_dBWHz(system_noise_temp_K):
+    return BOLTZMANN_DBW + 10.0 * math.log10(system_noise_temp_K)
+
+
+def pdf_escape_text(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
+def make_pdf_bytes(results: pd.DataFrame, scenario_df: pd.DataFrame, noise_df: pd.DataFrame) -> bytes:
+    lines = [
+        "BONSU LINK BUDGET EXPLORER",
+        "",
+        "Session Summary:",
+    ]
+    lines += [f"{row['Session']}: C/N0={row['C/N0 (dB-Hz)']:.2f} dB-Hz, Eb/N0={row['Eb/N0 (dB)']:.2f} dB, BER={row['BER']}" for _, row in results.iterrows()]
+    lines += ["", "Doppler scenarios:"]
+    for _, row in scenario_df.iterrows():
+        lines.append(f"{row['Scenario']}: uplink={row['Uplink Doppler shift (kHz)']} kHz, downlink={row['Downlink Doppler shift (kHz)']} kHz")
+    lines += ["", "Noise power density table:"]
+    for _, row in noise_df.iterrows():
+        lines.append(f"C/N0={row['C/N0 (dB-Hz)']} dB-Hz, N0={row['N0 (dBW/Hz)']:.2f}, Carrier={row['Carrier power (dBW)']:.2f}")
+
+    content_lines = [pdf_escape_text(line) for line in lines]
+    content = "BT /F1 12 Tf 50 760 Td\n"
+    for i, line in enumerate(content_lines):
+        if i > 0:
+            content += "T*\n"
+        content += f"({line}) Tj\n"
+    content += "ET"
+
+    content_bytes = content.encode("latin-1")
+    objects = []
+    offsets = []
+    pdf = b"%PDF-1.4\n"
+
+    # Catalog
+    offsets.append(len(pdf))
+    objects.append(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    pdf += objects[-1]
+
+    # Pages
+    offsets.append(len(pdf))
+    objects.append(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n")
+    pdf += objects[-1]
+
+    # Page
+    offsets.append(len(pdf))
+    page_stream = (
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n"
+    )
+    objects.append(page_stream)
+    pdf += objects[-1]
+
+    # Font
+    offsets.append(len(pdf))
+    objects.append(b"4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>\nendobj\n")
+    pdf += objects[-1]
+
+    # Content
+    offsets.append(len(pdf))
+    stream = content_bytes
+    stream_obj = f"5 0 obj\n<< /Length {len(stream)} >>\nstream\n".encode("latin-1") + stream + b"\nendstream\nendobj\n"
+    objects.append(stream_obj)
+    pdf += objects[-1]
+
+    xref_offset = len(pdf)
+    pdf += b"xref\n0 6\n0000000000 65535 f \n"
+    for offset in offsets:
+        pdf += f"{offset:010d} 00000 n \n".encode("latin-1")
+    pdf += b"trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n"
+    pdf += f"{xref_offset}\n".encode("latin-1")
+    pdf += b"%%EOF\n"
+    return pdf
+
+
+def make_excel_bytes(results: pd.DataFrame, scenario_df: pd.DataFrame, noise_df: pd.DataFrame) -> bytes | None:
+    engine = None
+    if importlib.util.find_spec("openpyxl") is not None:
+        engine = "openpyxl"
+    elif importlib.util.find_spec("xlsxwriter") is not None:
+        engine = "xlsxwriter"
+    if engine is None:
+        return None
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine=engine) as writer:
+        results.to_excel(writer, sheet_name="Session Results")
+        scenario_df.to_excel(writer, sheet_name="Doppler Scenarios", index=False)
+        noise_df.to_excel(writer, sheet_name="Noise vs CNo", index=False)
+    output.seek(0)
+    return output.read()
+
+
+SPEED_OF_LIGHT_M_S = 299792458.0
+
+
+def doppler_shift_hz(freq_hz, relative_velocity_m_s):
+    return freq_hz * (relative_velocity_m_s / SPEED_OF_LIGHT_M_S)
+
+
+def scenario_doppler_analysis(scenarios, uplink_freq_Hz, downlink_freq_Hz):
+    rows = []
+    for scenario in scenarios:
+        uplink_shift_hz = doppler_shift_hz(uplink_freq_Hz, scenario["velocity_m_s"])
+        downlink_shift_hz = doppler_shift_hz(downlink_freq_Hz, scenario["velocity_m_s"])
+        rows.append({
+            "Scenario": scenario["name"],
+            "Assumption": scenario["description"],
+            "Relative velocity (m/s)": scenario["velocity_m_s"],
+            "Uplink Doppler shift (kHz)": round(uplink_shift_hz / 1e3, 3),
+            "Downlink Doppler shift (kHz)": round(downlink_shift_hz / 1e3, 3),
+        })
+    return pd.DataFrame(rows)
+
+
 def total_loss_budget(losses):
     return sum(losses.values())
 
@@ -108,6 +225,9 @@ def session_performance(
     cn0_margin_dB = CN0_dBHz - required_CN0_dBHz
     achieved = ber_gmsk(EbN0_dB) <= target_BER
     cn0_achieved = CN0_dBHz >= required_CN0_dBHz
+    noise_temp_K_total = receiver_temp_K + lunar_noise_temp_K
+    noise_density_dBWHz = noise_power_density_dBWHz(noise_temp_K_total)
+    carrier_power_dBW = CN0_dBHz + noise_density_dBWHz
     return {
         "Session": name,
         "Slant range (km)": slant_km,
@@ -123,6 +243,8 @@ def session_performance(
         "BER": ber_gmsk(EbN0_dB),
         "BER target met": achieved,
         "C/N0 target met": cn0_achieved,
+        "N0 (dBW/Hz)": noise_density_dBWHz,
+        "Carrier power (dBW)": carrier_power_dBW,
     }
 
 
@@ -142,7 +264,7 @@ st.markdown(
 
 with st.sidebar:
     st.header("Link geometry")
-    distance_km = st.number_input("Distance (km)", value=440000.0, min_value=1000.0, max_value=1000000.0, step=1000.0)
+    distance_km = st.number_input("Distance (km)", value=440000.0, min_value=300.0, max_value=1000000.0, step=1000.0)
     elevation_deg = st.slider("Elevation angle (deg)", min_value=1.0, max_value=89.0, value=45.0, step=1.0)
     uplink_freq_Hz = st.number_input("Uplink frequency (Hz)", value=23.15e9, format="%.2f")
     downlink_freq_Hz = st.number_input("Downlink frequency (Hz)", value=27.5e9, format="%.2f")
@@ -164,6 +286,7 @@ with st.sidebar:
     scintillation_loss_dB = st.number_input("Scintillation loss (dB)", value=1.0, step=0.1)
     cloud_attenuation_dB = st.number_input("Cloud attenuation (dB)", value=0.5, step=0.1)
     pointing_loss_dB = st.number_input("Pointing loss (dB)", value=0.7, step=0.1)
+    polarization_loss_dB = st.number_input("Polarization coupling loss (dB)", value=0.5, step=0.1)
     weather_condition = st.selectbox("Weather condition", ["Clear sky", "Rainy"])
     weather_availability = st.slider("Weather availability (%)", min_value=50, max_value=100, value=95)
 
@@ -185,6 +308,7 @@ losses = {
     "Scintillation loss": scintillation_loss_dB,
     "Cloud attenuation": cloud_attenuation_dB,
     "Pointing loss": pointing_loss_dB,
+    "Polarization coupling loss": polarization_loss_dB,
 }
 
 # combine losses and weather effect
@@ -268,6 +392,44 @@ results_df["BER target met"] = results_df["BER target met"].map({True: "Yes", Fa
 results_df["C/N0 target met"] = results_df["C/N0 target met"].map({True: "Yes", False: "No"})
 st.dataframe(results_df)
 
+export_results_df = results_df.copy()
+export_results_df["BER"] = export_results_df["BER"].astype(str)
+export_results_df = export_results_df.reset_index()
+
+noise_temp_K_total = receiver_temp_K + lunar_noise_temp_K
+noise_density_dBWHz = noise_power_density_dBWHz(noise_temp_K_total)
+noise_power_df = pd.DataFrame({
+    "C/N0 (dB-Hz)": [x for x in range(20, 81, 5)],
+    "N0 (dBW/Hz)": [noise_density_dBWHz] * len(range(20, 81, 5)),
+})
+noise_power_df["Carrier power (dBW)"] = noise_power_df["C/N0 (dB-Hz)"] + noise_power_df["N0 (dBW/Hz)"]
+noise_power_df["C (dBW)"] = noise_power_df["Carrier power (dBW)"]
+
+excel_data = make_excel_bytes(export_results_df, scenario_df, noise_power_df) if 'scenario_df' in locals() else None
+pdf_data = make_pdf_bytes(export_results_df, scenario_df, noise_power_df) if 'scenario_df' in locals() else None
+
+col_pdf, col_excel = st.columns(2)
+with col_pdf:
+    if pdf_data is not None:
+        st.download_button(
+            "Download analysis as PDF",
+            pdf_data,
+            file_name="link_budget_analysis.pdf",
+            mime="application/pdf",
+        )
+    else:
+        st.warning("PDF export currently unavailable.")
+with col_excel:
+    if excel_data is not None:
+        st.download_button(
+            "Download analysis as Excel",
+            excel_data,
+            file_name="link_budget_analysis.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.warning("Excel export requires openpyxl or xlsxwriter.")
+
 selected = st.selectbox("Select session", results_df.index.tolist())
 
 base_eirp = {
@@ -277,8 +439,12 @@ base_eirp = {
     "Lander -> Ground": lander_EIRP_dBW,
 }[selected]
 
-freq = uplink_freq_Hz if "Uplink" in selected or "Lander -> Satellite" in selected else downlink_freq_Hz
-G_T = sat_G_T_dB if "Satellite" in selected else ground_G_T_dB
+if selected.endswith("Satellite"):
+    freq = uplink_freq_Hz
+    G_T = sat_G_T_dB
+else:
+    freq = downlink_freq_Hz
+    G_T = ground_G_T_dB
 
 eirp_values = [base_eirp + i * 0.5 for i in range(-20, 21)]
 margin_values = [
@@ -397,6 +563,163 @@ st.altair_chart((chart + required_line + actual_point).interactive(), use_contai
 st.write(
     f"LUNAnet realistic required C/N0 for target BER {target_BER:.0e} at {bit_rate_bps/1e6:.2f} Mbps = {required_cn0_line:.2f} dB-Hz"
 )
+
+st.subheader("Noise power density analysis")
+noise_temp_K_total = receiver_temp_K + lunar_noise_temp_K
+noise_density_dBWHz = noise_power_density_dBWHz(noise_temp_K_total)
+noise_power_df = pd.DataFrame({
+    "C/N0 (dB-Hz)": [x for x in range(20, 81, 5)],
+    "N0 (dBW/Hz)": [noise_density_dBWHz] * len(range(20, 81, 5)),
+})
+noise_power_df["Carrier power (dBW)"] = noise_power_df["C/N0 (dB-Hz)"] + noise_power_df["N0 (dBW/Hz)"]
+noise_power_df["C (dBW)"] = noise_power_df["Carrier power (dBW)"]
+
+st.write(
+    f"System noise temperature = {noise_temp_K_total:.1f} K, corresponding noise power density N0 = {noise_density_dBWHz:.2f} dBW/Hz."
+)
+st.dataframe(noise_power_df)
+noise_power_chart = alt.Chart(noise_power_df).mark_line(point=True).encode(
+    x=alt.X("C/N0 (dB-Hz):Q", title="C/N0 (dB-Hz)"),
+    y=alt.Y("Carrier power (dBW):Q", title="Required Carrier power (dBW)"),
+    tooltip=["C/N0 (dB-Hz)", "Carrier power (dBW)", "N0 (dBW/Hz)"],
+)
+st.altair_chart(noise_power_chart.interactive(), use_container_width=True)
+
+st.markdown(
+    "### Doppler frequency analysis\n"
+    "This analysis uses practical radial velocity assumptions for key mission phases and shows the expected uplink/downlink frequency shift at Ka-band. Doppler compensation becomes critical when shifts exceed tens of kilohertz, especially during LOI and low lunar orbit operations."
+)
+
+scenarios = [
+    {
+        "name": "Lunar South Pole Surface",
+        "velocity_m_s": 0.5,
+        "description": "Surface operations near the lunar south pole with small local motion; Doppler is dominated by Earth/Moon relative motion.",
+    },
+    {
+        "name": "Relay cruising",
+        "velocity_m_s": 1000.0,
+        "description": "Relay spacecraft en route to the Moon; moderate cruise radial speed produces tens of kilohertz of Doppler.",
+    },
+    {
+        "name": "Ground comm during cruising",
+        "velocity_m_s": 1100.0,
+        "description": "Earth-to-spacecraft link during lunar transfer; relative velocity introduces significant Doppler on Ka-band links.",
+    },
+    {
+        "name": "Lunar Orbit Insertion (LOI)",
+        "velocity_m_s": 1650.0,
+        "description": "High-speed lunar orbit insertion phase where Doppler compensation is most demanding.",
+    },
+    {
+        "name": "Low Lunar Orbit (LLOI)",
+        "velocity_m_s": 1680.0,
+        "description": "Low lunar orbit around the Moon; stable orbit speed still generates large Doppler shift for narrowband communications.",
+    },
+    {
+        "name": "Lunar surface operation (de Garleche)",
+        "velocity_m_s": 0.5,
+        "description": "Lunar lander or rover operations with minimal surface motion; Doppler is small but still present in Earth-spacecraft links.",
+    },
+]
+
+scenario_df = scenario_doppler_analysis(scenarios, uplink_freq_Hz, downlink_freq_Hz)
+
+st.write("### Doppler scenario table")
+st.dataframe(
+    scenario_df.style
+    .format({"Uplink Doppler shift (kHz)": "{:.3f}", "Downlink Doppler shift (kHz)": "{:.3f}"})
+    .background_gradient(subset=["Uplink Doppler shift (kHz)", "Downlink Doppler shift (kHz)"], cmap="RdYlGn_r")
+)
+
+st.write("### Doppler shift chart")
+doppler_chart_df = scenario_df.melt(
+    id_vars=["Scenario"],
+    value_vars=["Uplink Doppler shift (kHz)", "Downlink Doppler shift (kHz)"],
+    var_name="Link",
+    value_name="Doppler shift (kHz)",
+)
+chart = alt.Chart(doppler_chart_df).mark_bar().encode(
+    x=alt.X("Scenario:N", sort=None, title="Scenario"),
+    y=alt.Y("Doppler shift (kHz):Q", title="Doppler shift (kHz)"),
+    color=alt.Color("Link:N", title="Link"),
+    tooltip=["Scenario", "Link", "Doppler shift (kHz)"],
+)
+st.altair_chart(chart.interactive(), use_container_width=True)
+
+selected_doppler_scenario = st.selectbox("Select Doppler scenario for waveform", scenario_df["Scenario"].tolist())
+selected_scenario = next(s for s in scenarios if s["name"] == selected_doppler_scenario)
+selected_uplink_shift_hz = doppler_shift_hz(uplink_freq_Hz, selected_scenario["velocity_m_s"])
+selected_downlink_shift_hz = doppler_shift_hz(downlink_freq_Hz, selected_scenario["velocity_m_s"])
+selected_link = st.selectbox("Select Doppler waveform link", ["Uplink", "Downlink", "Both"], index=2)
+
+waveform_time = [i * 0.005 for i in range(801)]
+baseband_wave_hz = 2.0
+scale_for_display = 1e-5
+reference_wave = [math.sin(2.0 * math.pi * baseband_wave_hz * t) for t in waveform_time]
+uplink_wave = [
+    math.sin(2.0 * math.pi * (baseband_wave_hz + selected_uplink_shift_hz * scale_for_display) * t)
+    for t in waveform_time
+]
+downlink_wave = [
+    math.sin(2.0 * math.pi * (baseband_wave_hz + selected_downlink_shift_hz * scale_for_display) * t)
+    for t in waveform_time
+]
+
+waveform_rows = []
+for t, amp in zip(waveform_time, reference_wave):
+    waveform_rows.append({"Time (s)": t, "Signal": "Reference", "Amplitude": amp})
+for t, amp in zip(waveform_time, uplink_wave):
+    waveform_rows.append({"Time (s)": t, "Signal": "Uplink shifted", "Amplitude": amp})
+for t, amp in zip(waveform_time, downlink_wave):
+    waveform_rows.append({"Time (s)": t, "Signal": "Downlink shifted", "Amplitude": amp})
+waveform_df = pd.DataFrame(waveform_rows)
+
+if selected_link == "Uplink":
+    plot_df = waveform_df[waveform_df["Signal"].isin(["Reference", "Uplink shifted"])]
+elif selected_link == "Downlink":
+    plot_df = waveform_df[waveform_df["Signal"].isin(["Reference", "Downlink shifted"])]
+else:
+    plot_df = waveform_df
+
+st.write("### Doppler signal waveform")
+st.altair_chart(
+    alt.Chart(plot_df)
+    .mark_line()
+    .encode(
+        x=alt.X("Time (s):Q", title="Time (s)"),
+        y=alt.Y("Amplitude:Q", title="Synthetic signal amplitude"),
+        color=alt.Color("Signal:N", title="Signal"),
+        tooltip=["Time (s)", "Signal", "Amplitude"],
+    )
+    .interactive(),
+    use_container_width=True,
+)
+st.caption(
+    f"Synthetic waveform for {selected_doppler_scenario} showing the chosen link selection. The actual Ka-band Doppler shifts are {selected_uplink_shift_hz/1e3:.3f} kHz uplink and {selected_downlink_shift_hz/1e3:.3f} kHz downlink."
+)
+
+st.write("### Doppler waveform comparison")
+comparison_chart = alt.Chart(waveform_df).mark_line().encode(
+    x=alt.X("Time (s):Q", title="Time (s)"),
+    y=alt.Y("Amplitude:Q", title="Synthetic signal amplitude"),
+    color=alt.Color("Signal:N", title="Signal"),
+    tooltip=["Time (s)", "Signal", "Amplitude"],
+)
+st.altair_chart(comparison_chart.interactive(), use_container_width=True)
+st.caption(
+    "The reference waveform is shown alongside uplink and downlink Doppler-shifted signals. A small scaling factor is applied so the Doppler effect is visible in the time-domain plot."
+)
+
+with st.expander("Doppler assumptions and practical notes"):
+    st.markdown(
+        "- Lunar South Pole Surface: assume near-stationary surface operation and focus Doppler tracking on the moving relay/ground segments.\n"
+        "- Relay cruising: assume a 1 km/s radial component for lunar transfer and plan for ±100 kHz Doppler at Ka-band.\n"
+        "- Ground communication during cruising: Earth-relative speed adds additional Doppler, requiring agile frequency control and predictive tracking.\n"
+        "- LOI: use high-rate Doppler compensation since burn and insertion produce rapid frequency change.\n"
+        "- LLOI: the orbiting relay must maintain accurate Doppler compensation for narrowband GMSK channels.\n"
+        "- Lunar surface operation: surface nodes are effectively stationary, but the uplink/downlink still requires Earth/relay Doppler management."
+    )
 
 st.markdown("---")
 
