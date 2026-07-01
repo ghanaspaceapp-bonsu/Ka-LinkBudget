@@ -299,6 +299,14 @@ with st.sidebar:
     lander_G_T_dB = st.number_input("Lander G/T (dB/K)", value=5.0, step=0.1)
     lunar_noise_temp_K = st.number_input("Lunar noise temperature (K)", value=50.0, step=1.0)
     receiver_temp_K = st.number_input("Receiver noise temperature (K)", value=150.0, step=1.0)
+    system_noise_temp_K = st.number_input(
+        "System noise temperature (K)",
+        value=receiver_temp_K + lunar_noise_temp_K,
+        min_value=0.0,
+        max_value=300.0,
+        step=1.0,
+        help="Total system noise temperature used for the noise power density analysis.",
+    )
 
 losses = {
     "Modulation loss": modulation_loss_dB,
@@ -396,7 +404,7 @@ export_results_df = results_df.copy()
 export_results_df["BER"] = export_results_df["BER"].astype(str)
 export_results_df = export_results_df.reset_index()
 
-noise_temp_K_total = receiver_temp_K + lunar_noise_temp_K
+noise_temp_K_total = system_noise_temp_K
 noise_density_dBWHz = noise_power_density_dBWHz(noise_temp_K_total)
 noise_power_df = pd.DataFrame({
     "C/N0 (dB-Hz)": [x for x in range(20, 81, 5)],
@@ -417,8 +425,6 @@ with col_pdf:
             file_name="link_budget_analysis.pdf",
             mime="application/pdf",
         )
-    else:
-        st.warning("PDF export currently unavailable.")
 with col_excel:
     if excel_data is not None:
         st.download_button(
@@ -427,8 +433,6 @@ with col_excel:
             file_name="link_budget_analysis.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-    else:
-        st.warning("Excel export requires openpyxl or xlsxwriter.")
 
 selected = st.selectbox("Select session", results_df.index.tolist())
 
@@ -564,6 +568,8 @@ st.write(
     f"LUNAnet realistic required C/N0 for target BER {target_BER:.0e} at {bit_rate_bps/1e6:.2f} Mbps = {required_cn0_line:.2f} dB-Hz"
 )
 
+show_noise_analysis = False
+
 st.subheader("Noise power density analysis")
 noise_temp_K_total = receiver_temp_K + lunar_noise_temp_K
 noise_density_dBWHz = noise_power_density_dBWHz(noise_temp_K_total)
@@ -574,16 +580,17 @@ noise_power_df = pd.DataFrame({
 noise_power_df["Carrier power (dBW)"] = noise_power_df["C/N0 (dB-Hz)"] + noise_power_df["N0 (dBW/Hz)"]
 noise_power_df["C (dBW)"] = noise_power_df["Carrier power (dBW)"]
 
-st.write(
-    f"System noise temperature = {noise_temp_K_total:.1f} K, corresponding noise power density N0 = {noise_density_dBWHz:.2f} dBW/Hz."
-)
-st.dataframe(noise_power_df)
-noise_power_chart = alt.Chart(noise_power_df).mark_line(point=True).encode(
-    x=alt.X("C/N0 (dB-Hz):Q", title="C/N0 (dB-Hz)"),
-    y=alt.Y("Carrier power (dBW):Q", title="Required Carrier power (dBW)"),
-    tooltip=["C/N0 (dB-Hz)", "Carrier power (dBW)", "N0 (dBW/Hz)"],
-)
-st.altair_chart(noise_power_chart.interactive(), use_container_width=True)
+if show_noise_analysis:
+    st.write(
+        f"System noise temperature = {noise_temp_K_total:.1f} K, corresponding noise power density N0 = {noise_density_dBWHz:.2f} dBW/Hz."
+    )
+    st.dataframe(noise_power_df)
+    noise_power_chart = alt.Chart(noise_power_df).mark_line(point=True).encode(
+        x=alt.X("C/N0 (dB-Hz):Q", title="C/N0 (dB-Hz)"),
+        y=alt.Y("Carrier power (dBW):Q", title="Required Carrier power (dBW)"),
+        tooltip=["C/N0 (dB-Hz)", "Carrier power (dBW)", "N0 (dBW/Hz)"],
+    )
+    st.altair_chart(noise_power_chart.interactive(), use_container_width=True)
 
 st.markdown(
     "### Doppler frequency analysis\n"
@@ -735,5 +742,6 @@ st.write({
     "Total loss budget (dB)": round(loss_budget_dB, 2),
     "Lunar noise temperature (K)": lunar_noise_temp_K,
     "Receiver noise temperature (K)": receiver_temp_K,
+    "System noise temperature (K)": system_noise_temp_K,
     "LUNAnet version": LUNANET_VERSION,
 })
