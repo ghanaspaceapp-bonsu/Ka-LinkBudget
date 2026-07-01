@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+import math
+
+import pandas as pd
+import streamlit as st
+import altair as alt
+
+# ---------------------------------------
+# Constants
+# ---------------------------------------
+BOLTZMANN_DBW = -228.6  # dBW/K/Hz
+T0_K = 290.0
+LUNANET_VERSION = "V5"
+MODULATION_TYPE = "GMSK"
+
+# ---------------------------------------
+# Helper functions
+# ---------------------------------------
+
+def fspl(freq_hz, dist_km):
+    return 20.0 * math.log10(dist_km * 1000.0) + 20.0 * math.log10(freq_hz) - 147.55
+
+
+def slant_range(distance_km, elevation_deg):
+    elevation_rad = math.radians(max(min(elevation_deg, 89.9), 0.1))
+    return distance_km / math.cos(elevation_rad)
+
+
+def cn0(EIRP_dBW, G_T_dB, FSPL_dB, total_losses_dB):
+    return EIRP_dBW + G_T_dB - FSPL_dB - total_losses_dB - BOLTZMANN_DBW
+
+
+def ebn0_from_cn0(CN0_dBHz, Rb_bps):
+    return CN0_dBHz - 10.0 * math.log10(Rb_bps)
+
+
+def ber_gmsk(EbN0_dB):
+    snr_linear = 10.0 ** (EbN0_dB / 10.0)
+    x = math.sqrt(snr_linear / 2.0)
+    return 0.5 * math.erfc(x)
+
+
+def required_ebn0_for_ber_gmsk(target_ber):
+    # For GMSK, approximate BER with 0.5*erfc(sqrt(Eb/N0/2)).
+    if target_ber <= 0.0:
+        return 0.0
+    if target_ber >= 0.5:
+        return 100.0
+
+    def ber_from_ebn0(ebn0_dB):
+        return ber_gmsk(ebn0_dB)
+
+    lower = -10.0
+    upper = 50.0
+    for _ in range(60):
+        mid = 0.5 * (lower + upper)
+        if ber_from_ebn0(mid) > target_ber:
+            lower = mid
+        else:
+            upper = mid
+    return upper
+
+
+def required_cn0_for_ber(target_ber, bit_rate_bps, coding_gain_dB, coding_threshold_dB):
+    required_ebn0_dB = required_ebn0_for_ber_gmsk(target_ber) - coding_gain_dB + coding_threshold_dB
+    return required_ebn0_dB + 10.0 * math.log10(bit_rate_bps)
+
+
+def lunar_noise_loss_dB(lunar_noise_temp_K, receiver_temp_K):
+    return 10.0 * math.log10((receiver_temp_K + lunar_noise_temp_K) / T0_K)
+
+
+def coding_requirement(required_dB, coding_gain_dB, coding_threshold_dB):
+    return required_dB - coding_gain_dB + coding_threshold_dB
+
+
+def total_loss_budget(losses):
+    return sum(losses.values())
+
+
+def session_performance(
+    name,
+    EIRP_dBW,
+    G_T_dB,
+    freq_Hz,
+    distance_km,
+    elevation_deg,
+    bit_rate_bps,
+    total_losses_dB,
+    lunar_noise_temp_K,
+    receiver_temp_K,
+    required_EbN0_dB,
+    coding_gain_dB,
+    coding_threshold_dB,
+    target_BER,
+):
+    slant_km = slant_range(distance_km, elevation_deg)
+    FSPL_dB = fspl(freq_Hz, slant_km)
+    lunar_noise_dB = lunar_noise_loss_dB(lunar_noise_temp_K, receiver_temp_K)
+    effective_G_T_dB = G_T_dB - lunar_noise_dB
+    CN0_dBHz = cn0(EIRP_dBW, effective_G_T_dB, FSPL_dB, total_losses_dB)
+    EbN0_dB = ebn0_from_cn0(CN0_dBHz, bit_rate_bps)
+    required_dB = coding_requirement(required_EbN0_dB, coding_gain_dB, coding_threshold_dB)
+    target_EbN0_dB = required_ebn0_for_ber_gmsk(target_BER) - coding_gain_dB + coding_threshold_dB
+    required_CN0_dBHz = required_cn0_for_ber(target_BER, bit_rate_bps, coding_gain_dB, coding_threshold_dB)
+    margin_dB = EbN0_dB - required_dB
+    ber_margin_dB = EbN0_dB - target_EbN0_dB
+    cn0_margin_dB = CN0_dBHz - required_CN0_dBHz
+    achieved = ber_gmsk(EbN0_dB) <= target_BER
+    cn0_achieved = CN0_dBHz >= required_CN0_dBHz
+    return {
+        "Session": name,
+        "Slant range (km)": slant_km,
+        "FSPL (dB)": FSPL_dB,
+        "C/N0 (dB-Hz)": CN0_dBHz,
+        "Eb/N0 (dB)": EbN0_dB,
+        "Required Eb/N0 (dB)": required_dB,
+        "Target Eb/N0 for BER (dB)": target_EbN0_dB,
+        "Required C/N0 for BER (dB-Hz)": required_CN0_dBHz,
+        "C/N0 margin (dB)": cn0_margin_dB,
+        "Margin (dB)": margin_dB,
+        "BER margin (dB)": ber_margin_dB,
+        "BER": ber_gmsk(EbN0_dB),
+        "BER target met": achieved,
+        "C/N0 target met": cn0_achieved,
+    }
+
+
+# ---------------------------------------
+# Streamlit UI
+# ---------------------------------------
+
+st.set_page_config(page_title="BONSU LINK BUDGET EXPLORER", layout="wide")
+st.title("BONSU LINK BUDGET EXPLORER")
+st.markdown(
+    "This link budget tool was developed by Dr. Benjamin Bonsu, an RF expert with over 10 years of experience in lunar communications and space systems. Use this app to explore the LUNAnet V5 GMSK link chain, including Ground, Satellite, and Lander sessions."
+)
+st.markdown(
+    "### Technical insight\n"
+    "This model emphasizes the physical requirements for a reliable lunar link: free-space path loss at Ka-band, realistic implementation losses, lunar noise temperature, and the relationship between C/N0, Eb/N0, and BER. A positive margin indicates the link meets the required Eb/N0, while the C/N0 analysis shows the operational receive sensitivity needed to support the target BER."
+)
+
+with st.sidebar:
+    st.header("Link geometry")
+    distance_km = st.number_input("Distance (km)", value=440000.0, min_value=1000.0, max_value=1000000.0, step=1000.0)
+    elevation_deg = st.slider("Elevation angle (deg)", min_value=1.0, max_value=89.0, value=45.0, step=1.0)
+    uplink_freq_Hz = st.number_input("Uplink frequency (Hz)", value=23.15e9, format="%.2f")
+    downlink_freq_Hz = st.number_input("Downlink frequency (Hz)", value=27.5e9, format="%.2f")
+    bit_rate_bps = st.number_input("Bit rate (bps)", value=11e6, min_value=1000.0, max_value=500e6, step=1000.0)
+
+    st.header("LUNAnet V5 / GMSK")
+    modulation_index = st.slider("GMSK modulation index", min_value=0.3, max_value=1.0, value=0.7, step=0.05)
+    required_EbN0_dB = st.number_input("Baseline required Eb/N0 (dB)", value=9.6, step=0.1)
+    coding_gain_dB = st.number_input("Coding gain (dB)", value=3.0, step=0.1)
+    coding_ratio = st.selectbox("Coding ratio", ["1/2", "2/3", "3/4", "4/5"])
+    coding_threshold_dB = st.number_input("Coding threshold (dB)", value=1.5, step=0.1)
+    target_BER = st.number_input("Target BER", value=1e-5, format="%.0e", help="Desired BER target for GMSK.")
+
+    st.header("Loss budget")
+    modulation_loss_dB = st.number_input("Modulation loss (dB)", value=1.0, step=0.1)
+    receiver_loss_dB = st.number_input("Receiver loss (dB)", value=1.5, step=0.1)
+    atmospheric_loss_dB = st.number_input("Atmospheric loss (dB)", value=2.0, step=0.1)
+    gaseous_attenuation_dB = st.number_input("Gaseous attenuation (dB)", value=0.5, step=0.1)
+    scintillation_loss_dB = st.number_input("Scintillation loss (dB)", value=1.0, step=0.1)
+    cloud_attenuation_dB = st.number_input("Cloud attenuation (dB)", value=0.5, step=0.1)
+    pointing_loss_dB = st.number_input("Pointing loss (dB)", value=0.7, step=0.1)
+    weather_condition = st.selectbox("Weather condition", ["Clear sky", "Rainy"])
+    weather_availability = st.slider("Weather availability (%)", min_value=50, max_value=100, value=95)
+
+    st.header("Radio settings")
+    ground_EIRP_dBW = st.number_input("Ground EIRP (dBW)", value=89.0, step=0.5)
+    sat_EIRP_dBW = st.number_input("Satellite EIRP (dBW)", value=42.74, step=0.5)
+    lander_EIRP_dBW = st.number_input("Lander EIRP (dBW)", value=30.0, step=0.5)
+    ground_G_T_dB = st.number_input("Ground G/T (dB/K)", value=48.9, step=0.1)
+    sat_G_T_dB = st.number_input("Satellite G/T (dB/K)", value=8.6, step=0.1)
+    lander_G_T_dB = st.number_input("Lander G/T (dB/K)", value=5.0, step=0.1)
+    lunar_noise_temp_K = st.number_input("Lunar noise temperature (K)", value=50.0, step=1.0)
+    receiver_temp_K = st.number_input("Receiver noise temperature (K)", value=150.0, step=1.0)
+
+losses = {
+    "Modulation loss": modulation_loss_dB,
+    "Receiver hardware loss": receiver_loss_dB,
+    "Atmospheric loss": atmospheric_loss_dB,
+    "Gaseous attenuation": gaseous_attenuation_dB,
+    "Scintillation loss": scintillation_loss_dB,
+    "Cloud attenuation": cloud_attenuation_dB,
+    "Pointing loss": pointing_loss_dB,
+}
+
+# combine losses and weather effect
+loss_budget_dB = total_loss_budget(losses)
+if weather_condition == "Rainy":
+    loss_budget_dB += 3.0
+loss_budget_dB *= weather_availability / 100.0
+
+sessions = [
+    session_performance(
+        "Ground -> Satellite",
+        ground_EIRP_dBW,
+        sat_G_T_dB,
+        uplink_freq_Hz,
+        distance_km,
+        elevation_deg,
+        bit_rate_bps,
+        loss_budget_dB,
+        lunar_noise_temp_K,
+        receiver_temp_K,
+        required_EbN0_dB,
+        coding_gain_dB,
+        coding_threshold_dB,
+        target_BER,
+    ),
+    session_performance(
+        "Satellite -> Ground",
+        sat_EIRP_dBW,
+        ground_G_T_dB,
+        downlink_freq_Hz,
+        distance_km,
+        elevation_deg,
+        bit_rate_bps,
+        loss_budget_dB,
+        lunar_noise_temp_K,
+        receiver_temp_K,
+        required_EbN0_dB,
+        coding_gain_dB,
+        coding_threshold_dB,
+        target_BER,
+    ),
+    session_performance(
+        "Lander -> Satellite",
+        lander_EIRP_dBW,
+        sat_G_T_dB,
+        uplink_freq_Hz,
+        distance_km,
+        elevation_deg,
+        bit_rate_bps,
+        loss_budget_dB,
+        lunar_noise_temp_K,
+        receiver_temp_K,
+        required_EbN0_dB,
+        coding_gain_dB,
+        coding_threshold_dB,
+        target_BER,
+    ),
+    session_performance(
+        "Lander -> Ground",
+        lander_EIRP_dBW,
+        ground_G_T_dB,
+        downlink_freq_Hz,
+        distance_km,
+        elevation_deg,
+        bit_rate_bps,
+        loss_budget_dB,
+        lunar_noise_temp_K,
+        receiver_temp_K,
+        required_EbN0_dB,
+        coding_gain_dB,
+        coding_threshold_dB,
+        target_BER,
+    ),
+]
+
+st.subheader("Session results")
+results_df = pd.DataFrame(sessions).set_index("Session")
+results_df["BER"] = results_df["BER"].map(lambda x: f"{x:.2e}")
+results_df["Target BER"] = target_BER
+results_df["BER target met"] = results_df["BER target met"].map({True: "Yes", False: "No"})
+results_df["C/N0 target met"] = results_df["C/N0 target met"].map({True: "Yes", False: "No"})
+st.dataframe(results_df)
+
+selected = st.selectbox("Select session", results_df.index.tolist())
+
+base_eirp = {
+    "Ground -> Satellite": ground_EIRP_dBW,
+    "Satellite -> Ground": sat_EIRP_dBW,
+    "Lander -> Satellite": lander_EIRP_dBW,
+    "Lander -> Ground": lander_EIRP_dBW,
+}[selected]
+
+freq = uplink_freq_Hz if "Uplink" in selected or "Lander -> Satellite" in selected else downlink_freq_Hz
+G_T = sat_G_T_dB if "Satellite" in selected else ground_G_T_dB
+
+eirp_values = [base_eirp + i * 0.5 for i in range(-20, 21)]
+margin_values = [
+    session_performance(
+        selected,
+        eirp,
+        G_T,
+        freq,
+        distance_km,
+        elevation_deg,
+        bit_rate_bps,
+        loss_budget_dB,
+        lunar_noise_temp_K,
+        receiver_temp_K,
+        required_EbN0_dB,
+        coding_gain_dB,
+        coding_threshold_dB,
+        target_BER,
+    )["Margin (dB)"]
+    for eirp in eirp_values
+]
+
+rate_values = [max(1000.0, bit_rate_bps * factor) for factor in [0.25, 0.5, 1.0, 1.5, 2.0]]
+margin_rate_values = [
+    session_performance(
+        selected,
+        base_eirp,
+        G_T,
+        freq,
+        distance_km,
+        elevation_deg,
+        rate,
+        loss_budget_dB,
+        lunar_noise_temp_K,
+        receiver_temp_K,
+        required_EbN0_dB,
+        coding_gain_dB,
+        coding_threshold_dB,
+        target_BER,
+    )["Margin (dB)"]
+    for rate in rate_values
+]
+
+ebn0_values = [i * 0.5 for i in range(0, 41)]
+ber_values = [ber_gmsk(x) for x in ebn0_values]
+
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.write("### EIRP vs Margin")
+    chart_df = pd.DataFrame({"EIRP (dBW)": eirp_values, "Margin (dB)": margin_values})
+    chart = alt.Chart(chart_df).mark_line(point=True).encode(
+        x=alt.X("EIRP (dBW):Q", title="EIRP (dBW)"),
+        y=alt.Y("Margin (dB):Q", title="Margin (dB)"),
+        tooltip=["EIRP (dBW)", "Margin (dB)"],
+    ).interactive()
+    st.altair_chart(chart, use_container_width=True)
+with col2:
+    st.write("### Margin vs Data Rate")
+    chart_df = pd.DataFrame({"Data rate (Mbps)": [r / 1e6 for r in rate_values], "Margin (dB)": margin_rate_values})
+    chart = alt.Chart(chart_df).mark_line(point=True).encode(
+        x=alt.X("Data rate (Mbps):Q", title="Data Rate (Mbps)"),
+        y=alt.Y("Margin (dB):Q", title="Margin (dB)"),
+        tooltip=["Data rate (Mbps)", "Margin (dB)"],
+    ).interactive()
+    st.altair_chart(chart, use_container_width=True)
+with col3:
+    st.write("### Eb/N0 vs BER")
+    chart_df = pd.DataFrame({"Eb/N0 (dB)": ebn0_values, "BER": ber_values})
+    chart = alt.Chart(chart_df).mark_line(point=True).encode(
+        x=alt.X("Eb/N0 (dB):Q", title="Eb/N0 (dB)"),
+        y=alt.Y("BER:Q", title="BER (unitless)"),
+        tooltip=["Eb/N0 (dB)", "BER"],
+    ).interactive()
+    st.altair_chart(chart, use_container_width=True)
+
+st.subheader("C/N0 vs Eb/N0 Analysis")
+cn0_vs_ebn0_df = pd.DataFrame({
+    "Eb/N0 (dB)": [x for x in ebn0_values],
+    "C/N0 (dB-Hz)": [x + 10.0 * math.log10(bit_rate_bps) for x in ebn0_values],
+})
+required_cn0_line = required_cn0_for_ber(target_BER, bit_rate_bps, coding_gain_dB, coding_threshold_dB)
+current_session = session_performance(
+    selected,
+    base_eirp,
+    G_T,
+    freq,
+    distance_km,
+    elevation_deg,
+    bit_rate_bps,
+    loss_budget_dB,
+    lunar_noise_temp_K,
+    receiver_temp_K,
+    required_EbN0_dB,
+    coding_gain_dB,
+    coding_threshold_dB,
+    target_BER,
+)
+actual_cn0 = current_session["C/N0 (dB-Hz)"]
+actual_ebn0 = current_session["Eb/N0 (dB)"]
+
+chart = alt.Chart(cn0_vs_ebn0_df).mark_line(color="steelblue").encode(
+    x=alt.X("Eb/N0 (dB):Q", title="Eb/N0 (dB)"),
+    y=alt.Y("C/N0 (dB-Hz):Q", title="C/N0 (dB-Hz)"),
+    tooltip=["Eb/N0 (dB)", "C/N0 (dB-Hz)"],
+)
+required_line = alt.Chart(pd.DataFrame({"C/N0 (dB-Hz)": [required_cn0_line]})).mark_rule(color="red", strokeDash=[4,4]).encode(
+    y=alt.Y("C/N0 (dB-Hz):Q", title="C/N0 (dB-Hz)"),
+)
+actual_point = alt.Chart(pd.DataFrame({"Eb/N0 (dB)": [actual_ebn0], "C/N0 (dB-Hz)": [actual_cn0]})).mark_point(color="orange", size=100).encode(
+    x="Eb/N0 (dB):Q",
+    y="C/N0 (dB-Hz):Q",
+    tooltip=["Eb/N0 (dB)", "C/N0 (dB-Hz)"],
+)
+
+st.altair_chart((chart + required_line + actual_point).interactive(), use_container_width=True)
+st.write(
+    f"LUNAnet realistic required C/N0 for target BER {target_BER:.0e} at {bit_rate_bps/1e6:.2f} Mbps = {required_cn0_line:.2f} dB-Hz"
+)
+
+st.markdown("---")
+
+st.write("### LUNAnet V5 settings")
+st.write({
+    "Modulation": MODULATION_TYPE,
+    "Modulation index": modulation_index,
+    "Coding gain (dB)": coding_gain_dB,
+    "Coding ratio": coding_ratio,
+    "Coding threshold (dB)": coding_threshold_dB,
+    "Weather condition": weather_condition,
+    "Weather availability (%)": weather_availability,
+    "Total loss budget (dB)": round(loss_budget_dB, 2),
+    "Lunar noise temperature (K)": lunar_noise_temp_K,
+    "Receiver noise temperature (K)": receiver_temp_K,
+    "LUNAnet version": LUNANET_VERSION,
+})
